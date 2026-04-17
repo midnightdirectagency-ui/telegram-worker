@@ -33,6 +33,11 @@ const DC_ADDRESSES: Record<number, string> = {
   5: "91.108.56.130",
 };
 
+// ── Boot diagnostics ────────────────────────────────────────────────
+const BOOT_TIME = Date.now();
+const BOOT_ID = Math.random().toString(36).slice(2, 10);
+console.log(`[boot] worker booted. boot_id=${BOOT_ID} boot_time=${new Date(BOOT_TIME).toISOString()}`);
+
 // ── In-memory session store ─────────────────────────────────────────
 interface LiveSession {
   client: TelegramClient;
@@ -171,53 +176,55 @@ async function handleLoginTokenResult(
   }
 
   if (className === "auth.LoginTokenMigrateTo") {
-    console.log(`[DC migration] sid=${session.sessionId} → DC ${result.dcId}`);
-    const dcAddress = DC_ADDRESSES[result.dcId];
-    if (!dcAddress) {
-      session.state = "error";
-      session.error = `Unknown DC ${result.dcId}`;
-      return;
-    }
+    console.log(`[migrate] sid=${session.sessionId} target DC=${result.dcId}`);
 
-    const newClient = new TelegramClient(
-      client.session as StringSession,
-      API_ID,
-      API_HASH,
-      {
+    let migratedClient: TelegramClient | null = null;
+    try {
+      console.log(`[migrate] creating new client for DC ${result.dcId}`);
+      const migratedSession = new StringSession("");
+      migratedClient = new TelegramClient(migratedSession, API_ID, API_HASH, {
         connectionRetries: 3,
         deviceModel: "Lovable CRM",
         appVersion: "1.0.0",
-      }
-    );
+      });
 
-    try {
-      await (newClient as any)._switchDC(result.dcId);
-      await connectWithTimeout(newClient, 15000);
+      console.log(`[migrate] connecting target-DC client (pre-switch)`);
+      await connectWithTimeout(migratedClient, 15000);
+      console.log(`[migrate] connected, switching to DC ${result.dcId}`);
 
-      const importResult = await newClient.invoke(
+      await (migratedClient as any)._switchDC(result.dcId);
+      console.log(`[migrate] switched to DC ${result.dcId}`);
+
+      // small settle delay so the new DC sender is ready
+      await new Promise((r) => setTimeout(r, 300));
+
+      console.log(`[migrate] invoking ImportLoginToken on DC ${result.dcId}`);
+      const importResult: any = await migratedClient.invoke(
         new Api.auth.ImportLoginToken({ token: result.token })
       );
+      console.log(`[migrate] ImportLoginToken result className=${importResult?.className}`);
 
-      console.log(`[DC migration] Import result: ${importResult?.className}`);
-
-      if ((importResult as any)?.className === "auth.LoginTokenSuccess") {
-        await finalizeAuth(session, newClient);
+      if (importResult?.className === "auth.LoginTokenSuccess") {
+        session.client = migratedClient;
         try { client.disconnect(); } catch {}
-        session.client = newClient;
-      } else if ((importResult as any)?.className === "auth.LoginToken") {
-        session.qrUrl = tokenToUrl((importResult as any).token);
+        await finalizeAuth(session, migratedClient);
+      } else if (importResult?.className === "auth.LoginToken") {
+        // Telegram returned a refreshed QR token — surface it to the user
+        session.qrUrl = tokenToUrl(importResult.token);
+        session.expires = importResult.expires;
+        session.client = migratedClient;
       } else {
-        session.state = "error";
-        session.error = `Unexpected import result: ${importResult?.className}`;
+        throw new Error(`Unexpected ImportLoginToken result: ${importResult?.className}`);
       }
     } catch (err: any) {
-      console.error(`[DC migration] Error:`, err);
-      if (err.message?.includes("SESSION_PASSWORD_NEEDED")) {
+      console.error(`[migrate] FAILED:`, err?.message || err);
+      if (err?.message?.includes("SESSION_PASSWORD_NEEDED")) {
         session.state = "needs_password";
-        session.client = newClient;
+        if (migratedClient) session.client = migratedClient;
       } else {
         session.state = "error";
-        session.error = err.message;
+        session.error = `DC migration to ${result.dcId} failed: ${err?.message || err}`;
+        try { migratedClient?.disconnect(); } catch {}
       }
     }
     return;
@@ -320,7 +327,9 @@ app.post("/qr/init", async (req, res) => {
 
     console.log(`[init] Event handler registered. QR ready.`);
 
-    res.json({ qr_url: qrUrl, expires });
+    console.log(`[init] sid=${session_id} stored. boot_id=${BOOT_ID} activeSessions=${sessions.size}`);
+
+    res.json({ qr_url: qrUrl, expires, boot_id: BOOT_ID });
   } catch (err: any) {
     console.error(`[init] Error:`, err);
     res.status(500).json({ error: err.message });
@@ -333,7 +342,10 @@ app.get("/qr/check/:sessionId", (req, res) => {
   const session = sessions.get(sessionId);
 
   if (!session) {
-    return res.status(404).json({ error: "Session not found", status: "expired" });
+    const uptime = Math.round((Date.now() - BOOT_TIME) / 1000);
+    const knownIds = [...sessions.keys()].join(",");
+    console.warn(`[check] sid=${sessionId} NOT FOUND. boot_id=${BOOT_ID} uptime=${uptime}s activeSessions=${sessions.size} knownIds=[${knownIds}]`);
+    return res.status(404).json({ error: "Session not found", status: "expired", boot_id: BOOT_ID, uptime_seconds: uptime, active_sessions: sessions.size });
   }
 
   console.log(`[check] sid=${sessionId} state=${session.state} eventFired=${session.eventFired}`);
