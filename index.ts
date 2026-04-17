@@ -38,13 +38,113 @@ const BOOT_TIME = Date.now();
 const BOOT_ID = Math.random().toString(36).slice(2, 10);
 console.log(`[boot] worker booted. boot_id=${BOOT_ID} boot_time=${new Date(BOOT_TIME).toISOString()}`);
 
+// ── Lovable Cloud session bridge (no direct Supabase access from worker) ──
+const LOVABLE_SESSION_URL = process.env.LOVABLE_SESSION_URL || "";
+if (!LOVABLE_SESSION_URL) {
+  console.warn("[startup] LOVABLE_SESSION_URL missing — /send rehydration will fail after worker restart.");
+}
+
+async function fetchSessionFromCloud(sessionId: string): Promise<any | null> {
+  if (!LOVABLE_SESSION_URL) return null;
+  const r = await fetch(LOVABLE_SESSION_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${WORKER_SECRET}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ action: "get", session_id: sessionId }),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    console.error(`[rehydrate] sid=${sessionId} cloud fetch failed: ${r.status} ${t.slice(0, 200)}`);
+    return null;
+  }
+  const json = await r.json().catch(() => null);
+  return json?.session ?? null;
+}
+
+async function persistSessionStringToCloud(sessionId: string, sessionString: string): Promise<void> {
+  if (!LOVABLE_SESSION_URL) return;
+  const r = await fetch(LOVABLE_SESSION_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${WORKER_SECRET}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ action: "update_session_string", session_id: sessionId, session_string: sessionString }),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    console.warn(`[persist] sid=${sessionId} cloud update failed: ${r.status} ${t.slice(0, 200)}`);
+  }
+}
+
+async function getOrRehydrateSession(sessionId: string): Promise<LiveSession | null> {
+  const existing = sessions.get(sessionId);
+  if (existing && existing.client) {
+    try {
+      const sender = (existing.client as any)._sender;
+      if (!sender || !sender.isConnected || !sender.isConnected()) {
+        console.log(`[rehydrate] sid=${sessionId} live session present but not connected — reconnecting`);
+        await connectWithTimeout(existing.client, 15000);
+      }
+    } catch (e: any) {
+      console.warn(`[rehydrate] sid=${sessionId} reconnect check failed: ${e?.message}`);
+    }
+    return existing;
+  }
+
+  if (!LOVABLE_SESSION_URL) {
+    console.error(`[rehydrate] sid=${sessionId} LOVABLE_SESSION_URL not set — cannot rehydrate`);
+    return null;
+  }
+
+  console.log(`[rehydrate] sid=${sessionId} not in memory — fetching from Lovable Cloud`);
+  try {
+    const row = await fetchSessionFromCloud(sessionId);
+    if (!row || !row.session_string) {
+      console.error(`[rehydrate] sid=${sessionId} no row or empty session_string returned from cloud`);
+      return null;
+    }
+
+    const stringSession = new StringSession(row.session_string);
+    const client = new TelegramClient(stringSession, API_ID, API_HASH, {
+      connectionRetries: 3,
+      deviceModel: "Lovable CRM",
+      appVersion: "1.0.0",
+    });
+    await connectWithTimeout(client, 15000);
+    console.log(`[rehydrate] sid=${sessionId} connected OK`);
+
+    const live: LiveSession = {
+      client,
+      state: "authorized",
+      userId: row.user_id,
+      sessionId: row.id,
+      finalizeUrl: "",
+      telegramName: row.telegram_name,
+      telegramUsername: row.telegram_username,
+      telegramUserId: row.telegram_user_id,
+      phone: row.phone,
+      eventFired: true,
+      finalized: true,
+      createdAt: Date.now(),
+    };
+    sessions.set(sessionId, live);
+    return live;
+  } catch (err: any) {
+    console.error(`[rehydrate] sid=${sessionId} error: ${err?.message}`);
+    return null;
+  }
+}
+
 // ── In-memory session store ─────────────────────────────────────────
 interface LiveSession {
   client: TelegramClient;
   state: "waiting" | "needs_password" | "authorized" | "error";
-  userId: string;       // Supabase user_id
-  sessionId: string;    // telegram_sessions.id
-  finalizeUrl: string;  // edge function URL for callback
+  userId: string;
+  sessionId: string;
+  finalizeUrl: string;
   qrUrl?: string;
   expires?: number;
   telegramName?: string | null;
@@ -59,11 +159,10 @@ interface LiveSession {
 
 const sessions = new Map<string, LiveSession>();
 
-// Auto-cleanup every 60s — remove sessions older than 5 min
 setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
-    if (now - s.createdAt > 5 * 60 * 1000) {
+    if (now - s.createdAt > 5 * 60 * 1000 && !s.finalized) {
       console.log(`[cleanup] Removing stale session ${id}`);
       try { s.client.disconnect(); } catch {}
       sessions.delete(id);
@@ -81,7 +180,6 @@ function authMiddleware(req: express.Request, res: express.Response, next: expre
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
-
 function tokenToUrl(token: Buffer): string {
   const base64 = token.toString("base64url");
   return `tg://login?token=${base64}`;
@@ -180,7 +278,6 @@ async function handleLoginTokenResult(
 
     let migratedClient: TelegramClient | null = null;
     try {
-      console.log(`[migrate] creating new client for DC ${result.dcId}`);
       const migratedSession = new StringSession("");
       migratedClient = new TelegramClient(migratedSession, API_ID, API_HASH, {
         connectionRetries: 3,
@@ -188,17 +285,10 @@ async function handleLoginTokenResult(
         appVersion: "1.0.0",
       });
 
-      console.log(`[migrate] connecting target-DC client (pre-switch)`);
       await connectWithTimeout(migratedClient, 15000);
-      console.log(`[migrate] connected, switching to DC ${result.dcId}`);
-
       await (migratedClient as any)._switchDC(result.dcId);
-      console.log(`[migrate] switched to DC ${result.dcId}`);
-
-      // small settle delay so the new DC sender is ready
       await new Promise((r) => setTimeout(r, 300));
 
-      console.log(`[migrate] invoking ImportLoginToken on DC ${result.dcId}`);
       const importResult: any = await migratedClient.invoke(
         new Api.auth.ImportLoginToken({ token: result.token })
       );
@@ -209,7 +299,6 @@ async function handleLoginTokenResult(
         try { client.disconnect(); } catch {}
         await finalizeAuth(session, migratedClient);
       } else if (importResult?.className === "auth.LoginToken") {
-        // Telegram returned a refreshed QR token — surface it to the user
         session.qrUrl = tokenToUrl(importResult.token);
         session.expires = importResult.expires;
         session.client = migratedClient;
@@ -243,9 +332,8 @@ const app = express();
 app.use(express.json());
 app.use(authMiddleware);
 
-// Health check
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, activeSessions: sessions.size });
+  res.json({ ok: true, activeSessions: sessions.size, boot_id: BOOT_ID });
 });
 
 // ── POST /qr/init ──────────────────────────────────────────────────
@@ -266,7 +354,6 @@ app.post("/qr/init", async (req, res) => {
     });
 
     await connectWithTimeout(client, 15000);
-    console.log(`[init] Connected to Telegram`);
 
     const result = await client.invoke(
       new Api.auth.ExportLoginToken({
@@ -275,8 +362,6 @@ app.post("/qr/init", async (req, res) => {
         exceptIds: [],
       })
     );
-
-    console.log(`[init] ExportLoginToken result: ${result?.className}`);
 
     if (result?.className !== "auth.LoginToken") {
       return res.status(500).json({ error: `Unexpected: ${result?.className}` });
@@ -301,7 +386,6 @@ app.post("/qr/init", async (req, res) => {
 
     client.addEventHandler(async (update: any) => {
       if (update?.className !== "UpdateLoginToken") return;
-
       console.log(`\n[EVENT] UpdateLoginToken fired for sid=${session_id}`);
       liveSession.eventFired = true;
 
@@ -325,10 +409,6 @@ app.post("/qr/init", async (req, res) => {
       }
     });
 
-    console.log(`[init] Event handler registered. QR ready.`);
-
-    console.log(`[init] sid=${session_id} stored. boot_id=${BOOT_ID} activeSessions=${sessions.size}`);
-
     res.json({ qr_url: qrUrl, expires, boot_id: BOOT_ID });
   } catch (err: any) {
     console.error(`[init] Error:`, err);
@@ -343,12 +423,8 @@ app.get("/qr/check/:sessionId", (req, res) => {
 
   if (!session) {
     const uptime = Math.round((Date.now() - BOOT_TIME) / 1000);
-    const knownIds = [...sessions.keys()].join(",");
-    console.warn(`[check] sid=${sessionId} NOT FOUND. boot_id=${BOOT_ID} uptime=${uptime}s activeSessions=${sessions.size} knownIds=[${knownIds}]`);
     return res.status(404).json({ error: "Session not found", status: "expired", boot_id: BOOT_ID, uptime_seconds: uptime, active_sessions: sessions.size });
   }
-
-  console.log(`[check] sid=${sessionId} state=${session.state} eventFired=${session.eventFired}`);
 
   const response: any = {
     status: session.state,
@@ -360,14 +436,8 @@ app.get("/qr/check/:sessionId", (req, res) => {
     response.telegram_name = session.telegramName;
     response.telegram_username = session.telegramUsername;
   }
-
-  if (session.state === "error") {
-    response.error = session.error;
-  }
-
-  if (session.qrUrl) {
-    response.qr_url = session.qrUrl;
-  }
+  if (session.state === "error") response.error = session.error;
+  if (session.qrUrl) response.qr_url = session.qrUrl;
 
   res.json(response);
 });
@@ -378,28 +448,17 @@ app.post("/qr/password/:sessionId", async (req, res) => {
   const { password } = req.body;
   const session = sessions.get(sessionId);
 
-  if (!session) {
-    return res.status(404).json({ error: "Session not found" });
-  }
-
-  if (!password) {
-    return res.status(400).json({ error: "password required" });
-  }
-
-  console.log(`[password] sid=${sessionId}`);
+  if (!session) return res.status(404).json({ error: "Session not found" });
+  if (!password) return res.status(400).json({ error: "password required" });
 
   try {
     const result = await session.client.invoke(
       new Api.auth.CheckPassword({
         password: await session.client.invoke(new Api.account.GetPassword()).then(
-          (pwd: any) => {
-            return (session.client as any).computeSrpPassword(pwd, password);
-          }
+          (pwd: any) => (session.client as any).computeSrpPassword(pwd, password)
         ),
       })
     );
-
-    console.log(`[password] Result: ${result?.className}`);
 
     if ((result as any)?.className === "auth.Authorization") {
       await finalizeAuth(session, session.client);
@@ -414,6 +473,72 @@ app.post("/qr/password/:sessionId", async (req, res) => {
   } catch (err: any) {
     console.error(`[password] Error:`, err);
     res.status(400).json({ error: err.message });
+  }
+});
+
+// ── POST /send/:sessionId ──────────────────────────────────────────
+app.post("/send/:sessionId", async (req, res) => {
+  const { sessionId } = req.params;
+  const { chat_id, text, reply_to_msg_id } = req.body || {};
+
+  if (typeof chat_id !== "number" || typeof text !== "string" || !text.length) {
+    return res.status(400).json({ error: "chat_id (number) and text (string) required" });
+  }
+  if (text.length > 4096) {
+    return res.status(400).json({ error: "text too long (max 4096)" });
+  }
+
+  console.log(`\n[send] sid=${sessionId} chat_id=${chat_id} reply_to=${reply_to_msg_id ?? "none"} text_len=${text.length}`);
+
+  try {
+    const live = await getOrRehydrateSession(sessionId);
+    if (!live) {
+      console.error(`[send] sid=${sessionId} no live session and rehydrate failed`);
+      return res.status(404).json({ error: "Session not found or could not be rehydrated" });
+    }
+
+    const client = live.client;
+
+    let entity: any;
+    try {
+      console.log(`[send] sid=${sessionId} resolving entity for chat_id=${chat_id}...`);
+      entity = await client.getEntity(chat_id);
+      const eid = typeof entity?.id === "bigint" ? entity.id.toString() : entity?.id;
+      console.log(`[send] sid=${sessionId} entity resolved: className=${entity?.className} id=${eid}`);
+    } catch (resolveErr: any) {
+      const msg = resolveErr?.message || String(resolveErr);
+      console.error(`[send] sid=${sessionId} entity resolution FAILED: ${msg}`);
+      return res.status(400).json({ error: `entity resolution failed: ${msg}` });
+    }
+
+    let result: any;
+    try {
+      const sendOpts: any = { message: text };
+      if (typeof reply_to_msg_id === "number") sendOpts.replyTo = reply_to_msg_id;
+      result = await client.sendMessage(entity, sendOpts);
+      console.log(`[send] sid=${sessionId} sendMessage OK message_id=${result?.id} date=${result?.date}`);
+    } catch (sendErr: any) {
+      const msg = sendErr?.message || String(sendErr);
+      console.error(`[send] sid=${sessionId} sendMessage FAILED: ${msg}`);
+      return res.status(502).json({ error: `sendMessage failed: ${msg}` });
+    }
+
+    try {
+      const newSessionString = (client.session as StringSession).save();
+      if (newSessionString) await persistSessionStringToCloud(sessionId, newSessionString);
+    } catch (persistErr: any) {
+      console.warn(`[send] sid=${sessionId} session persist failed (non-fatal): ${persistErr?.message}`);
+    }
+
+    return res.json({
+      ok: true,
+      message_id: typeof result?.id === "bigint" ? Number(result.id) : result?.id,
+      date: typeof result?.date === "bigint" ? Number(result.date) : result?.date,
+    });
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    console.error(`[send] sid=${sessionId} unexpected error: ${msg}`);
+    return res.status(500).json({ error: msg });
   }
 });
 
