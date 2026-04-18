@@ -39,6 +39,10 @@ const BOOT_ID = Math.random().toString(36).slice(2, 10);
 console.log(`[boot] worker booted. boot_id=${BOOT_ID} boot_time=${new Date(BOOT_TIME).toISOString()}`);
 
 // ── Lovable Cloud session bridge (no direct Supabase access from worker) ──
+// LOVABLE_SESSION_URL points to the protected edge function:
+//   https://<project>.functions.supabase.co/telegram-worker-session
+// The worker authenticates with Bearer ${WORKER_SECRET}; the edge function
+// verifies the secret and returns session_string (or accepts updates).
 const LOVABLE_SESSION_URL = process.env.LOVABLE_SESSION_URL || "";
 if (!LOVABLE_SESSION_URL) {
   console.warn("[startup] LOVABLE_SESSION_URL missing — /send rehydration will fail after worker restart.");
@@ -147,6 +151,7 @@ async function upsertPeerToCloud(
   }
 }
 
+// Best-effort: extract peer metadata from a GramJS entity and persist it.
 async function persistEntityPeer(sessionId: string, chatId: number, entity: any): Promise<void> {
   try {
     const className: string | undefined = entity?.className;
@@ -184,6 +189,7 @@ async function persistEntityPeer(sessionId: string, chatId: number, entity: any)
   }
 }
 
+// Build an explicit InputPeer from stored metadata (used when GramJS cache is empty).
 function buildInputPeerFromStored(stored: StoredPeer, chatId: number): any | null {
   const peerType = (stored.peer_type || stored.chat_type || "").toLowerCase();
   try {
@@ -196,6 +202,7 @@ function buildInputPeerFromStored(stored: StoredPeer, chatId: number): any | nul
     }
     if (peerType === "channel" || peerType === "supergroup") {
       if (!stored.access_hash) return null;
+      // Channel IDs are stored as negative bigints in some clients; normalize to positive.
       const rawId = BigInt(chatId);
       const normalized = rawId < 0n ? -rawId : rawId;
       return new Api.InputPeerChannel({
@@ -277,17 +284,24 @@ function attachLiveMessageHandler(sessionId: string, client: TelegramClient): vo
       const msgId = Number(msg.id ?? 0);
       if (!chatId || !msgId) return;
 
+      // Outbound messages are persisted by telegram-client-send (the direct send path).
+      // Skip them here to avoid creating a second DB row with a different update_id.
+      if (isOut) {
+        console.log(`[live-msg] sid=${sessionId} skip outbound chat=${chatId} mid=${msgId} (handled by telegram-client-send)`);
+        return;
+      }
+
       const updateId = Math.abs(chatId * 1_000_000 + msgId);
       const text = typeof msg.message === "string" ? msg.message : null;
       const date = typeof msg.date === "number" ? msg.date : null;
 
-      console.log(`[live-msg] sid=${sessionId} recv chat=${chatId} mid=${msgId} dir=${isOut ? "outbound" : "inbound"} t=${recvAt}`);
+      console.log(`[live-msg] sid=${sessionId} recv chat=${chatId} mid=${msgId} dir=inbound t=${recvAt}`);
 
       await postStoreMessage({
         session_id: sessionId,
         chat_id: chatId,
         update_id: updateId,
-        direction: isOut ? "outbound" : "inbound",
+        direction: "inbound",
         text,
         sender_name: null,
         message_date: date,
@@ -367,9 +381,9 @@ async function getOrRehydrateSession(sessionId: string): Promise<LiveSession | n
 interface LiveSession {
   client: TelegramClient;
   state: "waiting" | "needs_password" | "authorized" | "error";
-  userId: string;
-  sessionId: string;
-  finalizeUrl: string;
+  userId: string;       // Supabase user_id
+  sessionId: string;    // telegram_sessions.id
+  finalizeUrl: string;  // edge function URL for callback
   qrUrl?: string;
   expires?: number;
   telegramName?: string | null;
@@ -384,7 +398,9 @@ interface LiveSession {
 
 const sessions = new Map<string, LiveSession>();
 
-// Auto-cleanup every 60s — only remove unauthorized stale sessions
+// Auto-cleanup every 60s — only remove unauthorized stale sessions (QR flows that
+// never completed). Authorized sessions stay resident so the live message handler
+// keeps firing for inbound updates.
 setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
@@ -478,6 +494,8 @@ async function finalizeAuth(session: LiveSession, client: TelegramClient) {
 
     session.finalized = true;
     session.state = "authorized";
+    // Attach the live message handler immediately so inbound updates flow
+    // through the bridge without waiting for the first /send call.
     try { attachLiveMessageHandler(session.sessionId, client); } catch (e: any) {
       console.warn(`[finalizeAuth] attach live handler warn: ${e?.message}`);
     }
@@ -523,6 +541,7 @@ async function handleLoginTokenResult(
       await (migratedClient as any)._switchDC(result.dcId);
       console.log(`[migrate] switched to DC ${result.dcId}`);
 
+      // small settle delay so the new DC sender is ready
       await new Promise((r) => setTimeout(r, 300));
 
       console.log(`[migrate] invoking ImportLoginToken on DC ${result.dcId}`);
@@ -536,6 +555,7 @@ async function handleLoginTokenResult(
         try { client.disconnect(); } catch {}
         await finalizeAuth(session, migratedClient);
       } else if (importResult?.className === "auth.LoginToken") {
+        // Telegram returned a refreshed QR token — surface it to the user
         session.qrUrl = tokenToUrl(importResult.token);
         session.expires = importResult.expires;
         session.client = migratedClient;
@@ -652,6 +672,7 @@ app.post("/qr/init", async (req, res) => {
     });
 
     console.log(`[init] Event handler registered. QR ready.`);
+
     console.log(`[init] sid=${session_id} stored. boot_id=${BOOT_ID} activeSessions=${sessions.size}`);
 
     res.json({ qr_url: qrUrl, expires, boot_id: BOOT_ID });
@@ -743,6 +764,8 @@ app.post("/qr/password/:sessionId", async (req, res) => {
 });
 
 // ── POST /send/:sessionId ──────────────────────────────────────────
+// Send an outbound Telegram message via the live worker client.
+// Body: { chat_id: number, text: string, reply_to_msg_id?: number }
 app.post("/send/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const { chat_id, text, reply_to_msg_id } = req.body || {};
@@ -765,6 +788,12 @@ app.post("/send/:sessionId", async (req, res) => {
 
     const client = live.client;
 
+    // ── Resolve target peer using a 5-step fallback chain ─────────────
+    // 1. client.getEntity(chat_id) — uses GramJS in-memory cache.
+    // 2. Stored peer (peer_type + access_hash) from Lovable Cloud bridge.
+    // 3. Construct explicit InputPeer{User|Channel|Chat}.
+    // 4. Last resort: client.getDialogs() to repopulate cache, then retry getEntity.
+    // 5. Clean error to UI with debug info.
     let target: any = null;
     let resolvedEntity: any = null;
     const tried: string[] = [];
@@ -810,6 +839,7 @@ app.post("/send/:sessionId", async (req, res) => {
       try {
         const dialogs: any = await client.getDialogs({ limit: 500 });
         console.log(`[send] sid=${sessionId} step4 fetched ${dialogs?.length ?? 0} dialogs`);
+        // Persist any peer metadata we just learned about.
         try {
           for (const d of dialogs || []) {
             const ent = d?.entity;
@@ -837,7 +867,7 @@ app.post("/send/:sessionId", async (req, res) => {
       }
     }
 
-    // Step 4.5: ResolveUsername fallback
+    // Step 4.5: ResolveUsername fallback — when stored row has username but no access_hash.
     if (!target) {
       tried.push("resolveUsername");
       try {
@@ -852,6 +882,7 @@ app.post("/send/:sessionId", async (req, res) => {
           );
           const users = resolved?.users || [];
           const chats = resolved?.chats || [];
+          // Find the matching entity
           let matched: any = null;
           for (const u of users) {
             const uid = typeof u?.id === "bigint" ? Number(u.id) : u?.id;
@@ -863,13 +894,16 @@ app.post("/send/:sessionId", async (req, res) => {
               if (cid === chat_id) { matched = c; break; }
             }
           }
+          // Fallback: take the first user/chat returned
           if (!matched && users.length > 0) matched = users[0];
           if (!matched && chats.length > 0) matched = chats[0];
 
           if (matched) {
             console.log(`[send] sid=${sessionId} step4.5 resolved className=${matched.className} hasAccessHash=${matched.accessHash != null}`);
+            // Persist learned access_hash for next time
             const matchedId = typeof matched.id === "bigint" ? Number(matched.id) : matched.id;
             await persistEntityPeer(sessionId, matchedId, matched);
+            // Build InputPeer from this entity
             if (matched.className === "User" && matched.accessHash != null) {
               target = new Api.InputPeerUser({
                 userId: BigInt(matchedId) as any,
@@ -926,14 +960,18 @@ app.post("/send/:sessionId", async (req, res) => {
       return res.status(502).json({ error: `sendMessage failed: ${msg}` });
     }
 
+    // After successful send, persist resolved entity peer back (insurance for future restarts).
     try {
       if (resolvedEntity) {
         await persistEntityPeer(sessionId, chat_id, resolvedEntity);
+      } else if (!stored?.access_hash) {
+        // We sent via InputPeer with stored hash — nothing new to learn.
       }
     } catch (peerPersistErr: any) {
       console.warn(`[send] sid=${sessionId} post-send peer persist warn: ${peerPersistErr?.message}`);
     }
 
+    // Persist (possibly rotated) session string back to Lovable Cloud — best effort
     try {
       const newSessionString = (client.session as StringSession).save();
       if (newSessionString) {
@@ -951,6 +989,190 @@ app.post("/send/:sessionId", async (req, res) => {
   } catch (err: any) {
     const msg = err?.message || String(err);
     console.error(`[send] sid=${sessionId} unexpected error: ${msg}`);
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// ── POST /send-media/:sessionId ────────────────────────────────────
+// Body: { chat_id: number, media_url: string, file_name: string, media_type: "image"|"video", mime_type?: string }
+app.post("/send-media/:sessionId", async (req, res) => {
+  const { sessionId } = req.params;
+  const { chat_id, media_url, file_name, media_type, mime_type } = req.body || {};
+
+  if (typeof chat_id !== "number" || typeof media_url !== "string" || !media_url || !file_name || !media_type) {
+    return res.status(400).json({ error: "chat_id, media_url, file_name, media_type required" });
+  }
+
+  console.log(`[send-media] sid=${sessionId} chat_id=${chat_id} type=${media_type} file=${file_name}`);
+
+  try {
+    const live = await getOrRehydrateSession(sessionId);
+    if (!live) {
+      return res.status(404).json({ error: "Session not found or could not be rehydrated" });
+    }
+    const client = live.client;
+
+    // Resolve target peer (reuse 5-step logic, simplified)
+    let target: any = null;
+    let resolvedEntity: any = null;
+    let stored: StoredPeer | null = null;
+    let lastErr: string | null = null;
+
+    try {
+      resolvedEntity = await client.getEntity(chat_id);
+      target = resolvedEntity;
+    } catch (e: any) {
+      lastErr = e?.message || String(e);
+    }
+
+    if (!target) {
+      stored = await fetchPeerFromCloud(sessionId, chat_id);
+      if (stored) {
+        const inputPeer = buildInputPeerFromStored(stored, chat_id);
+        if (inputPeer) target = inputPeer;
+      }
+    }
+
+    if (!target) {
+      try {
+        await client.getDialogs({ limit: 200 });
+        resolvedEntity = await client.getEntity(chat_id);
+        target = resolvedEntity;
+      } catch (e: any) {
+        lastErr = e?.message || String(e);
+      }
+    }
+
+    if (!target) {
+      return res.status(400).json({ error: `entity resolution failed: ${lastErr || "unknown"}` });
+    }
+
+    // Download media from signed URL
+    let buffer: Buffer;
+    try {
+      const r = await fetch(media_url);
+      if (!r.ok) {
+        return res.status(502).json({ error: `media download failed: ${r.status}` });
+      }
+      const ab = await r.arrayBuffer();
+      buffer = Buffer.from(ab);
+      console.log(`[send-media] sid=${sessionId} downloaded ${buffer.length} bytes`);
+    } catch (dlErr: any) {
+      return res.status(502).json({ error: `media download error: ${dlErr?.message}` });
+    }
+
+    // Build CustomFile for GramJS
+    const { CustomFile } = await import("telegram/client/uploads.js");
+    const customFile = new CustomFile(file_name, buffer.length, "", buffer);
+
+    let result: any;
+    try {
+      result = await client.sendFile(target, {
+        file: customFile,
+        forceDocument: false,
+        videoNote: false,
+        supportsStreaming: media_type === "video",
+        // No caption — media only, per product requirement
+      });
+      console.log(`[send-media] sid=${sessionId} sendFile OK message_id=${result?.id}`);
+    } catch (sendErr: any) {
+      const msg = sendErr?.message || String(sendErr);
+      console.error(`[send-media] sid=${sessionId} sendFile FAILED: ${msg}`);
+      return res.status(502).json({ error: `sendFile failed: ${msg}` });
+    }
+
+    try {
+      if (resolvedEntity) await persistEntityPeer(sessionId, chat_id, resolvedEntity);
+    } catch {}
+
+    try {
+      const newSessionString = (client.session as StringSession).save();
+      if (newSessionString) await persistSessionStringToCloud(sessionId, newSessionString);
+    } catch {}
+
+    return res.json({
+      ok: true,
+      message_id: typeof result?.id === "bigint" ? Number(result.id) : result?.id,
+      date: typeof result?.date === "bigint" ? Number(result.date) : result?.date,
+    });
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    console.error(`[send-media] sid=${sessionId} unexpected error: ${msg}`);
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// ── POST /delete-message/:sessionId ────────────────────────────────
+// Delete a message from a chat. With revoke=true, deletes for both sides
+// (sender + recipient) on Telegram. Body: { chat_id, message_id, revoke? }
+app.post("/delete-message/:sessionId", async (req, res) => {
+  const { sessionId } = req.params;
+  const { chat_id, message_id, revoke } = req.body || {};
+
+  if (typeof chat_id !== "number" || typeof message_id !== "number") {
+    return res.status(400).json({ error: "chat_id and message_id (numbers) required" });
+  }
+
+  console.log(`[delete-msg] sid=${sessionId} chat=${chat_id} mid=${message_id} revoke=${revoke !== false}`);
+
+  try {
+    const live = await getOrRehydrateSession(sessionId);
+    if (!live) {
+      return res.status(404).json({ error: "Session not found or could not be rehydrated" });
+    }
+
+    const client = live.client;
+
+    // Resolve target peer (reuse same fallback chain as /send, simplified)
+    let target: any = null;
+    let resolvedEntity: any = null;
+    try {
+      resolvedEntity = await client.getEntity(chat_id);
+      target = resolvedEntity;
+    } catch (e: any) {
+      console.warn(`[delete-msg] sid=${sessionId} getEntity failed: ${e?.message}`);
+    }
+
+    if (!target) {
+      const stored = await fetchPeerFromCloud(sessionId, chat_id);
+      if (stored) {
+        const inputPeer = buildInputPeerFromStored(stored, chat_id);
+        if (inputPeer) target = inputPeer;
+      }
+    }
+
+    if (!target) {
+      try {
+        await client.getDialogs({ limit: 200 });
+        resolvedEntity = await client.getEntity(chat_id);
+        target = resolvedEntity;
+      } catch (e: any) {
+        console.warn(`[delete-msg] sid=${sessionId} dialog refresh failed: ${e?.message}`);
+      }
+    }
+
+    if (!target) {
+      return res.status(400).json({ error: `entity resolution failed for chat ${chat_id}` });
+    }
+
+    try {
+      await client.deleteMessages(target, [message_id], { revoke: revoke !== false });
+      console.log(`[delete-msg] sid=${sessionId} delete OK mid=${message_id}`);
+    } catch (delErr: any) {
+      const msg = delErr?.message || String(delErr);
+      console.error(`[delete-msg] sid=${sessionId} delete FAILED: ${msg}`);
+      return res.status(502).json({ error: `deleteMessages failed: ${msg}` });
+    }
+
+    try {
+      const newSessionString = (client.session as StringSession).save();
+      if (newSessionString) await persistSessionStringToCloud(sessionId, newSessionString);
+    } catch {}
+
+    return res.json({ ok: true });
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    console.error(`[delete-msg] sid=${sessionId} unexpected error: ${msg}`);
     return res.status(500).json({ error: msg });
   }
 });
