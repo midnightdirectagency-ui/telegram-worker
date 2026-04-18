@@ -39,6 +39,10 @@ const BOOT_ID = Math.random().toString(36).slice(2, 10);
 console.log(`[boot] worker booted. boot_id=${BOOT_ID} boot_time=${new Date(BOOT_TIME).toISOString()}`);
 
 // ── Lovable Cloud session bridge (no direct Supabase access from worker) ──
+// LOVABLE_SESSION_URL points to the protected edge function:
+//   https://<project>.functions.supabase.co/telegram-worker-session
+// The worker authenticates with Bearer ${WORKER_SECRET}; the edge function
+// verifies the secret and returns session_string (or accepts updates).
 const LOVABLE_SESSION_URL = process.env.LOVABLE_SESSION_URL || "";
 if (!LOVABLE_SESSION_URL) {
   console.warn("[startup] LOVABLE_SESSION_URL missing — /send rehydration will fail after worker restart.");
@@ -79,6 +83,145 @@ async function persistSessionStringToCloud(sessionId: string, sessionString: str
   }
 }
 
+// ── Peer metadata bridge ────────────────────────────────────────────
+interface StoredPeer {
+  chat_id: number;
+  peer_type: string | null;
+  access_hash: string | null;
+  username: string | null;
+  chat_title: string | null;
+  chat_type?: string | null;
+}
+
+async function fetchPeerFromCloud(sessionId: string, chatId: number): Promise<StoredPeer | null> {
+  if (!LOVABLE_SESSION_URL) return null;
+  try {
+    const r = await fetch(LOVABLE_SESSION_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WORKER_SECRET}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ action: "get_peer", session_id: sessionId, chat_id: chatId }),
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      console.warn(`[peer] get_peer failed sid=${sessionId} chat=${chatId}: ${r.status} ${t.slice(0, 200)}`);
+      return null;
+    }
+    const json = await r.json().catch(() => null);
+    return json?.peer ?? null;
+  } catch (err: any) {
+    console.warn(`[peer] get_peer error sid=${sessionId} chat=${chatId}: ${err?.message}`);
+    return null;
+  }
+}
+
+async function upsertPeerToCloud(
+  sessionId: string,
+  chatId: number,
+  peerType: string | null,
+  accessHash: string | null,
+  extra?: { chat_title?: string | null; username?: string | null }
+): Promise<void> {
+  if (!LOVABLE_SESSION_URL) return;
+  try {
+    const r = await fetch(LOVABLE_SESSION_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${WORKER_SECRET}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        action: "upsert_peer",
+        session_id: sessionId,
+        chat_id: chatId,
+        peer_type: peerType,
+        access_hash: accessHash,
+        chat_title: extra?.chat_title ?? null,
+        username: extra?.username ?? null,
+      }),
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      console.warn(`[peer] upsert_peer failed sid=${sessionId} chat=${chatId}: ${r.status} ${t.slice(0, 200)}`);
+    }
+  } catch (err: any) {
+    console.warn(`[peer] upsert_peer error sid=${sessionId} chat=${chatId}: ${err?.message}`);
+  }
+}
+
+// Best-effort: extract peer metadata from a GramJS entity and persist it.
+async function persistEntityPeer(sessionId: string, chatId: number, entity: any): Promise<void> {
+  try {
+    const className: string | undefined = entity?.className;
+    let peerType: string | null = null;
+    let accessHash: string | null = null;
+
+    if (className === "User") {
+      peerType = "user";
+      if (entity.accessHash !== undefined && entity.accessHash !== null) {
+        accessHash = typeof entity.accessHash === "bigint" ? entity.accessHash.toString() : String(entity.accessHash);
+      }
+    } else if (className === "Channel" || className === "ChannelForbidden") {
+      peerType = "channel";
+      if (entity.accessHash !== undefined && entity.accessHash !== null) {
+        accessHash = typeof entity.accessHash === "bigint" ? entity.accessHash.toString() : String(entity.accessHash);
+      }
+    } else if (className === "Chat" || className === "ChatForbidden") {
+      peerType = "chat";
+    } else {
+      return;
+    }
+
+    const title =
+      entity.title ??
+      [entity.firstName, entity.lastName].filter(Boolean).join(" ") ??
+      null;
+    const username = entity.username ?? null;
+
+    await upsertPeerToCloud(sessionId, chatId, peerType, accessHash, {
+      chat_title: title || null,
+      username,
+    });
+  } catch (err: any) {
+    console.warn(`[peer] persistEntityPeer error sid=${sessionId} chat=${chatId}: ${err?.message}`);
+  }
+}
+
+// Build an explicit InputPeer from stored metadata (used when GramJS cache is empty).
+function buildInputPeerFromStored(stored: StoredPeer, chatId: number): any | null {
+  const peerType = (stored.peer_type || stored.chat_type || "").toLowerCase();
+  try {
+    if (peerType === "user") {
+      if (!stored.access_hash) return null;
+      return new Api.InputPeerUser({
+        userId: BigInt(chatId) as any,
+        accessHash: BigInt(stored.access_hash) as any,
+      });
+    }
+    if (peerType === "channel" || peerType === "supergroup") {
+      if (!stored.access_hash) return null;
+      // Channel IDs are stored as negative bigints in some clients; normalize to positive.
+      const rawId = BigInt(chatId);
+      const normalized = rawId < 0n ? -rawId : rawId;
+      return new Api.InputPeerChannel({
+        channelId: normalized as any,
+        accessHash: BigInt(stored.access_hash) as any,
+      });
+    }
+    if (peerType === "chat" || peerType === "group") {
+      const rawId = BigInt(chatId);
+      const normalized = rawId < 0n ? -rawId : rawId;
+      return new Api.InputPeerChat({ chatId: normalized as any });
+    }
+  } catch (err: any) {
+    console.warn(`[peer] buildInputPeerFromStored failed chat=${chatId}: ${err?.message}`);
+  }
+  return null;
+}
+
+// Rehydrate a session from Lovable Cloud if not in memory (worker restart case)
 async function getOrRehydrateSession(sessionId: string): Promise<LiveSession | null> {
   const existing = sessions.get(sessionId);
   if (existing && existing.client) {
@@ -142,9 +285,9 @@ async function getOrRehydrateSession(sessionId: string): Promise<LiveSession | n
 interface LiveSession {
   client: TelegramClient;
   state: "waiting" | "needs_password" | "authorized" | "error";
-  userId: string;
-  sessionId: string;
-  finalizeUrl: string;
+  userId: string;       // Supabase user_id
+  sessionId: string;    // telegram_sessions.id
+  finalizeUrl: string;  // edge function URL for callback
   qrUrl?: string;
   expires?: number;
   telegramName?: string | null;
@@ -159,10 +302,11 @@ interface LiveSession {
 
 const sessions = new Map<string, LiveSession>();
 
+// Auto-cleanup every 60s — remove sessions older than 5 min
 setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
-    if (now - s.createdAt > 5 * 60 * 1000 && !s.finalized) {
+    if (now - s.createdAt > 5 * 60 * 1000) {
       console.log(`[cleanup] Removing stale session ${id}`);
       try { s.client.disconnect(); } catch {}
       sessions.delete(id);
@@ -180,6 +324,7 @@ function authMiddleware(req: express.Request, res: express.Response, next: expre
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
 function tokenToUrl(token: Buffer): string {
   const base64 = token.toString("base64url");
   return `tg://login?token=${base64}`;
@@ -278,6 +423,7 @@ async function handleLoginTokenResult(
 
     let migratedClient: TelegramClient | null = null;
     try {
+      console.log(`[migrate] creating new client for DC ${result.dcId}`);
       const migratedSession = new StringSession("");
       migratedClient = new TelegramClient(migratedSession, API_ID, API_HASH, {
         connectionRetries: 3,
@@ -285,10 +431,17 @@ async function handleLoginTokenResult(
         appVersion: "1.0.0",
       });
 
+      console.log(`[migrate] connecting target-DC client (pre-switch)`);
       await connectWithTimeout(migratedClient, 15000);
+      console.log(`[migrate] connected, switching to DC ${result.dcId}`);
+
       await (migratedClient as any)._switchDC(result.dcId);
+      console.log(`[migrate] switched to DC ${result.dcId}`);
+
+      // small settle delay so the new DC sender is ready
       await new Promise((r) => setTimeout(r, 300));
 
+      console.log(`[migrate] invoking ImportLoginToken on DC ${result.dcId}`);
       const importResult: any = await migratedClient.invoke(
         new Api.auth.ImportLoginToken({ token: result.token })
       );
@@ -299,6 +452,7 @@ async function handleLoginTokenResult(
         try { client.disconnect(); } catch {}
         await finalizeAuth(session, migratedClient);
       } else if (importResult?.className === "auth.LoginToken") {
+        // Telegram returned a refreshed QR token — surface it to the user
         session.qrUrl = tokenToUrl(importResult.token);
         session.expires = importResult.expires;
         session.client = migratedClient;
@@ -332,8 +486,9 @@ const app = express();
 app.use(express.json());
 app.use(authMiddleware);
 
+// Health check
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, activeSessions: sessions.size, boot_id: BOOT_ID });
+  res.json({ ok: true, activeSessions: sessions.size });
 });
 
 // ── POST /qr/init ──────────────────────────────────────────────────
@@ -354,6 +509,7 @@ app.post("/qr/init", async (req, res) => {
     });
 
     await connectWithTimeout(client, 15000);
+    console.log(`[init] Connected to Telegram`);
 
     const result = await client.invoke(
       new Api.auth.ExportLoginToken({
@@ -362,6 +518,8 @@ app.post("/qr/init", async (req, res) => {
         exceptIds: [],
       })
     );
+
+    console.log(`[init] ExportLoginToken result: ${result?.className}`);
 
     if (result?.className !== "auth.LoginToken") {
       return res.status(500).json({ error: `Unexpected: ${result?.className}` });
@@ -386,6 +544,7 @@ app.post("/qr/init", async (req, res) => {
 
     client.addEventHandler(async (update: any) => {
       if (update?.className !== "UpdateLoginToken") return;
+
       console.log(`\n[EVENT] UpdateLoginToken fired for sid=${session_id}`);
       liveSession.eventFired = true;
 
@@ -409,6 +568,10 @@ app.post("/qr/init", async (req, res) => {
       }
     });
 
+    console.log(`[init] Event handler registered. QR ready.`);
+
+    console.log(`[init] sid=${session_id} stored. boot_id=${BOOT_ID} activeSessions=${sessions.size}`);
+
     res.json({ qr_url: qrUrl, expires, boot_id: BOOT_ID });
   } catch (err: any) {
     console.error(`[init] Error:`, err);
@@ -423,8 +586,12 @@ app.get("/qr/check/:sessionId", (req, res) => {
 
   if (!session) {
     const uptime = Math.round((Date.now() - BOOT_TIME) / 1000);
+    const knownIds = [...sessions.keys()].join(",");
+    console.warn(`[check] sid=${sessionId} NOT FOUND. boot_id=${BOOT_ID} uptime=${uptime}s activeSessions=${sessions.size} knownIds=[${knownIds}]`);
     return res.status(404).json({ error: "Session not found", status: "expired", boot_id: BOOT_ID, uptime_seconds: uptime, active_sessions: sessions.size });
   }
+
+  console.log(`[check] sid=${sessionId} state=${session.state} eventFired=${session.eventFired}`);
 
   const response: any = {
     status: session.state,
@@ -436,8 +603,14 @@ app.get("/qr/check/:sessionId", (req, res) => {
     response.telegram_name = session.telegramName;
     response.telegram_username = session.telegramUsername;
   }
-  if (session.state === "error") response.error = session.error;
-  if (session.qrUrl) response.qr_url = session.qrUrl;
+
+  if (session.state === "error") {
+    response.error = session.error;
+  }
+
+  if (session.qrUrl) {
+    response.qr_url = session.qrUrl;
+  }
 
   res.json(response);
 });
@@ -448,17 +621,28 @@ app.post("/qr/password/:sessionId", async (req, res) => {
   const { password } = req.body;
   const session = sessions.get(sessionId);
 
-  if (!session) return res.status(404).json({ error: "Session not found" });
-  if (!password) return res.status(400).json({ error: "password required" });
+  if (!session) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+
+  if (!password) {
+    return res.status(400).json({ error: "password required" });
+  }
+
+  console.log(`[password] sid=${sessionId}`);
 
   try {
     const result = await session.client.invoke(
       new Api.auth.CheckPassword({
         password: await session.client.invoke(new Api.account.GetPassword()).then(
-          (pwd: any) => (session.client as any).computeSrpPassword(pwd, password)
+          (pwd: any) => {
+            return (session.client as any).computeSrpPassword(pwd, password);
+          }
         ),
       })
     );
+
+    console.log(`[password] Result: ${result?.className}`);
 
     if ((result as any)?.className === "auth.Authorization") {
       await finalizeAuth(session, session.client);
@@ -477,6 +661,8 @@ app.post("/qr/password/:sessionId", async (req, res) => {
 });
 
 // ── POST /send/:sessionId ──────────────────────────────────────────
+// Send an outbound Telegram message via the live worker client.
+// Body: { chat_id: number, text: string, reply_to_msg_id?: number }
 app.post("/send/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const { chat_id, text, reply_to_msg_id } = req.body || {};
@@ -499,23 +685,171 @@ app.post("/send/:sessionId", async (req, res) => {
 
     const client = live.client;
 
-    let entity: any;
+    // ── Resolve target peer using a 5-step fallback chain ─────────────
+    // 1. client.getEntity(chat_id) — uses GramJS in-memory cache.
+    // 2. Stored peer (peer_type + access_hash) from Lovable Cloud bridge.
+    // 3. Construct explicit InputPeer{User|Channel|Chat}.
+    // 4. Last resort: client.getDialogs() to repopulate cache, then retry getEntity.
+    // 5. Clean error to UI with debug info.
+    let target: any = null;
+    let resolvedEntity: any = null;
+    const tried: string[] = [];
+    let stored: StoredPeer | null = null;
+    let lastErr: string | null = null;
+
+    // Step 1: getEntity
     try {
-      console.log(`[send] sid=${sessionId} resolving entity for chat_id=${chat_id}...`);
-      entity = await client.getEntity(chat_id);
-      const eid = typeof entity?.id === "bigint" ? entity.id.toString() : entity?.id;
-      console.log(`[send] sid=${sessionId} entity resolved: className=${entity?.className} id=${eid}`);
-    } catch (resolveErr: any) {
-      const msg = resolveErr?.message || String(resolveErr);
-      console.error(`[send] sid=${sessionId} entity resolution FAILED: ${msg}`);
-      return res.status(400).json({ error: `entity resolution failed: ${msg}` });
+      tried.push("getEntity");
+      console.log(`[send] sid=${sessionId} step1 getEntity chat_id=${chat_id}`);
+      resolvedEntity = await client.getEntity(chat_id);
+      target = resolvedEntity;
+      const eid = typeof resolvedEntity?.id === "bigint" ? resolvedEntity.id.toString() : resolvedEntity?.id;
+      console.log(`[send] sid=${sessionId} step1 OK className=${resolvedEntity?.className} id=${eid}`);
+    } catch (e: any) {
+      lastErr = e?.message || String(e);
+      console.warn(`[send] sid=${sessionId} step1 getEntity failed: ${lastErr}`);
     }
 
+    // Step 2 + 3: stored peer → explicit InputPeer
+    if (!target) {
+      tried.push("storedPeer");
+      stored = await fetchPeerFromCloud(sessionId, chat_id);
+      console.log(
+        `[send] sid=${sessionId} step2 stored peer: ${
+          stored ? `peer_type=${stored.peer_type || stored.chat_type} has_access_hash=${!!stored.access_hash}` : "none"
+        }`
+      );
+      if (stored) {
+        const inputPeer = buildInputPeerFromStored(stored, chat_id);
+        if (inputPeer) {
+          tried.push("inputPeer");
+          target = inputPeer;
+          console.log(`[send] sid=${sessionId} step3 built InputPeer className=${inputPeer.className}`);
+        }
+      }
+    }
+
+    // Step 4: getDialogs refresh + retry
+    if (!target) {
+      tried.push("getDialogsRefresh");
+      console.log(`[send] sid=${sessionId} step4 refreshing dialogs to repopulate entity cache`);
+      try {
+        const dialogs: any = await client.getDialogs({ limit: 500 });
+        console.log(`[send] sid=${sessionId} step4 fetched ${dialogs?.length ?? 0} dialogs`);
+        // Persist any peer metadata we just learned about.
+        try {
+          for (const d of dialogs || []) {
+            const ent = d?.entity;
+            const idVal = ent?.id;
+            const idNum =
+              typeof idVal === "bigint" ? Number(idVal) : typeof idVal === "number" ? idVal : null;
+            if (idNum !== null) {
+              await persistEntityPeer(sessionId, idNum, ent);
+            }
+          }
+        } catch (persistAllErr: any) {
+          console.warn(`[send] sid=${sessionId} step4 dialog persist warn: ${persistAllErr?.message}`);
+        }
+
+        try {
+          resolvedEntity = await client.getEntity(chat_id);
+          target = resolvedEntity;
+          console.log(`[send] sid=${sessionId} step4 retry getEntity OK className=${resolvedEntity?.className}`);
+        } catch (e2: any) {
+          lastErr = e2?.message || String(e2);
+          console.warn(`[send] sid=${sessionId} step4 retry getEntity failed: ${lastErr}`);
+        }
+      } catch (dialogErr: any) {
+        console.warn(`[send] sid=${sessionId} step4 getDialogs failed: ${dialogErr?.message}`);
+      }
+    }
+
+    // Step 4.5: ResolveUsername fallback — when stored row has username but no access_hash.
+    if (!target) {
+      tried.push("resolveUsername");
+      try {
+        if (!stored) {
+          stored = await fetchPeerFromCloud(sessionId, chat_id);
+        }
+        const uname = stored?.username || null;
+        console.log(`[send] sid=${sessionId} step4.5 resolveUsername uname=${uname || "none"}`);
+        if (uname) {
+          const resolved: any = await client.invoke(
+            new Api.contacts.ResolveUsername({ username: uname })
+          );
+          const users = resolved?.users || [];
+          const chats = resolved?.chats || [];
+          // Find the matching entity
+          let matched: any = null;
+          for (const u of users) {
+            const uid = typeof u?.id === "bigint" ? Number(u.id) : u?.id;
+            if (uid === chat_id) { matched = u; break; }
+          }
+          if (!matched) {
+            for (const c of chats) {
+              const cid = typeof c?.id === "bigint" ? Number(c.id) : c?.id;
+              if (cid === chat_id) { matched = c; break; }
+            }
+          }
+          // Fallback: take the first user/chat returned
+          if (!matched && users.length > 0) matched = users[0];
+          if (!matched && chats.length > 0) matched = chats[0];
+
+          if (matched) {
+            console.log(`[send] sid=${sessionId} step4.5 resolved className=${matched.className} hasAccessHash=${matched.accessHash != null}`);
+            // Persist learned access_hash for next time
+            const matchedId = typeof matched.id === "bigint" ? Number(matched.id) : matched.id;
+            await persistEntityPeer(sessionId, matchedId, matched);
+            // Build InputPeer from this entity
+            if (matched.className === "User" && matched.accessHash != null) {
+              target = new Api.InputPeerUser({
+                userId: BigInt(matchedId) as any,
+                accessHash: typeof matched.accessHash === "bigint" ? matched.accessHash : BigInt(matched.accessHash) as any,
+              });
+              resolvedEntity = matched;
+            } else if ((matched.className === "Channel" || matched.className === "ChannelForbidden") && matched.accessHash != null) {
+              target = new Api.InputPeerChannel({
+                channelId: BigInt(matchedId) as any,
+                accessHash: typeof matched.accessHash === "bigint" ? matched.accessHash : BigInt(matched.accessHash) as any,
+              });
+              resolvedEntity = matched;
+            }
+          } else {
+            console.warn(`[send] sid=${sessionId} step4.5 ResolveUsername returned no users/chats`);
+          }
+        }
+      } catch (resolveErr: any) {
+        console.warn(`[send] sid=${sessionId} step4.5 ResolveUsername failed: ${resolveErr?.message}`);
+      }
+    }
+
+    // Step 5: clean error
+    if (!target) {
+      const debug = {
+        tried,
+        peer_known: !!stored,
+        had_access_hash: !!stored?.access_hash,
+        peer_type: stored?.peer_type || stored?.chat_type || null,
+        had_username: !!stored?.username,
+      };
+      console.error(`[send] sid=${sessionId} entity resolution FAILED chat=${chat_id} debug=${JSON.stringify(debug)} last=${lastErr}`);
+      return res.status(400).json({
+        error: `entity resolution failed for chat ${chat_id} (peer_type=${debug.peer_type || "unknown"}, access_hash=${debug.had_access_hash ? "present" : "missing"}, username=${debug.had_username ? "present" : "missing"}): ${lastErr || "unknown"}`,
+        chat_id: String(chat_id),
+        peer_type: debug.peer_type,
+        had_access_hash: debug.had_access_hash,
+        had_username: debug.had_username,
+        tried: debug.tried,
+        telegram_error: lastErr,
+      });
+    }
+
+    // Send the message
     let result: any;
     try {
       const sendOpts: any = { message: text };
       if (typeof reply_to_msg_id === "number") sendOpts.replyTo = reply_to_msg_id;
-      result = await client.sendMessage(entity, sendOpts);
+      result = await client.sendMessage(target, sendOpts);
       console.log(`[send] sid=${sessionId} sendMessage OK message_id=${result?.id} date=${result?.date}`);
     } catch (sendErr: any) {
       const msg = sendErr?.message || String(sendErr);
@@ -523,9 +857,23 @@ app.post("/send/:sessionId", async (req, res) => {
       return res.status(502).json({ error: `sendMessage failed: ${msg}` });
     }
 
+    // After successful send, persist resolved entity peer back (insurance for future restarts).
+    try {
+      if (resolvedEntity) {
+        await persistEntityPeer(sessionId, chat_id, resolvedEntity);
+      } else if (!stored?.access_hash) {
+        // We sent via InputPeer with stored hash — nothing new to learn.
+      }
+    } catch (peerPersistErr: any) {
+      console.warn(`[send] sid=${sessionId} post-send peer persist warn: ${peerPersistErr?.message}`);
+    }
+
+    // Persist (possibly rotated) session string back to Lovable Cloud — best effort
     try {
       const newSessionString = (client.session as StringSession).save();
-      if (newSessionString) await persistSessionStringToCloud(sessionId, newSessionString);
+      if (newSessionString) {
+        await persistSessionStringToCloud(sessionId, newSessionString);
+      }
     } catch (persistErr: any) {
       console.warn(`[send] sid=${sessionId} session persist failed (non-fatal): ${persistErr?.message}`);
     }
