@@ -925,7 +925,6 @@ app.post("/send/:sessionId", async (req, res) => {
         console.warn(`[send] sid=${sessionId} step4.5 ResolveUsername failed: ${resolveErr?.message}`);
       }
     }
-
     // Step 5: clean error
     if (!target) {
       const debug = {
@@ -994,10 +993,11 @@ app.post("/send/:sessionId", async (req, res) => {
 });
 
 // ── POST /send-media/:sessionId ────────────────────────────────────
-// Body: { chat_id: number, media_url: string, file_name: string, media_type: "image"|"video", mime_type?: string }
+// Body: { chat_id: number, media_url: string, file_name: string, media_type: "image"|"video", mime_type?: string, caption?: string }
 app.post("/send-media/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
-  const { chat_id, media_url, file_name, media_type, mime_type } = req.body || {};
+  const { chat_id, media_url, file_name, media_type, mime_type, caption } = req.body || {};
+  const cleanCaption = typeof caption === "string" && caption.trim().length > 0 ? caption : undefined;
 
   if (typeof chat_id !== "number" || typeof media_url !== "string" || !media_url || !file_name || !media_type) {
     return res.status(400).json({ error: "chat_id, media_url, file_name, media_type required" });
@@ -1072,7 +1072,7 @@ app.post("/send-media/:sessionId", async (req, res) => {
         forceDocument: false,
         videoNote: false,
         supportsStreaming: media_type === "video",
-        // No caption — media only, per product requirement
+        ...(cleanCaption ? { caption: cleanCaption } : {}),
       });
       console.log(`[send-media] sid=${sessionId} sendFile OK message_id=${result?.id}`);
     } catch (sendErr: any) {
