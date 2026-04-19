@@ -925,6 +925,7 @@ app.post("/send/:sessionId", async (req, res) => {
         console.warn(`[send] sid=${sessionId} step4.5 ResolveUsername failed: ${resolveErr?.message}`);
       }
     }
+
     // Step 5: clean error
     if (!target) {
       const debug = {
@@ -993,17 +994,22 @@ app.post("/send/:sessionId", async (req, res) => {
 });
 
 // ── POST /send-media/:sessionId ────────────────────────────────────
-// Body: { chat_id: number, media_url: string, file_name: string, media_type: "image"|"video", mime_type?: string, caption?: string }
+// Body: { chat_id: number, media_url: string, file_name: string, media_type: "image"|"video", mime_type?: string, caption?: string, spoiler?: boolean }
 app.post("/send-media/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
-  const { chat_id, media_url, file_name, media_type, mime_type, caption } = req.body || {};
+  const { chat_id, media_url, file_name, media_type, mime_type, caption, parse_mode, spoiler } = req.body || {};
   const cleanCaption = typeof caption === "string" && caption.trim().length > 0 ? caption : undefined;
+  const useSpoiler = spoiler === true;
+  const cleanParseMode =
+    typeof parse_mode === "string" && ["html", "md", "markdown"].includes(parse_mode.toLowerCase())
+      ? parse_mode.toLowerCase()
+      : undefined;
 
   if (typeof chat_id !== "number" || typeof media_url !== "string" || !media_url || !file_name || !media_type) {
     return res.status(400).json({ error: "chat_id, media_url, file_name, media_type required" });
   }
 
-  console.log(`[send-media] sid=${sessionId} chat_id=${chat_id} type=${media_type} file=${file_name}`);
+  console.log(`[send-media] sid=${sessionId} chat_id=${chat_id} type=${media_type} file=${file_name} spoiler=${useSpoiler}`);
 
   try {
     const live = await getOrRehydrateSession(sessionId);
@@ -1072,8 +1078,11 @@ app.post("/send-media/:sessionId", async (req, res) => {
         forceDocument: false,
         videoNote: false,
         supportsStreaming: media_type === "video",
+        ...(useSpoiler ? { spoiler: true } : {}),
         ...(cleanCaption ? { caption: cleanCaption } : {}),
+        ...(cleanParseMode ? { parseMode: cleanParseMode } : {}),
       });
+      if (useSpoiler) console.log(`[send-media] sid=${sessionId} sent with native spoiler blur`);
       console.log(`[send-media] sid=${sessionId} sendFile OK message_id=${result?.id}`);
     } catch (sendErr: any) {
       const msg = sendErr?.message || String(sendErr);
